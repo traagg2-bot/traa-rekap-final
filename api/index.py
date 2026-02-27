@@ -12,9 +12,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
 # === CONFIG ===
-TOKEN = os.environ.get("BOT_TOKEN", "8708452430:AAENurTtTwMSZLPAz9rOLrR6GtnNxvg2GaI")
-OWNER_ID = int(os.environ.get("OWNER_ID", "6882937271"))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://traa-rekap-final.vercel.app/webhook")
+TOKEN = "8708452430:AAENurTtTwMSZLPAz9rOLrR6GtnNxvg2GaI"
+OWNER_ID = 6882937271
+WEBHOOK_URL = "https://traa-rekap-final.vercel.app/webhook"
 
 # === LOGGING ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 players_db = {}        # { "NAMA": balance }
 history_db = {}        # { chat_id: [game1, game2, ...] }
 settings_db = {}       # { chat_id: game_num }
-transactions_db = []   # List of transactions
 
 # === BOT APPLICATION ===
 application = Application.builder().token(TOKEN).build()
@@ -67,10 +66,6 @@ def bulatkan_ke_bawah(angka):
         return (angka // 100) * 100
     else:
         return -((abs(angka) + 99) // 100 * 100)
-
-def format_rupiah(angka):
-    """Format angka ke Rupiah"""
-    return f"Rp {angka:,}".replace(",", ".")
 
 # ==================== COMMAND HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -191,7 +186,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             score, winner = query.data.split('_')
             skor_simpan = score.replace("-", "")
-            loser = "BESAR" if winner == "KECIL" else "KECIL"
             
             # ===== PROSES SALDO UNTUK PEMENANG =====
             for p in rekap['data'][winner]:
@@ -201,19 +195,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     players_db[p['name']] += hasil_win
                 else:
                     players_db[p['name']] = hasil_win
-                
-                # Catat transaksi
-                transactions_db.append({
-                    'chat_id': chat_id,
-                    'username': p['name'],
-                    'amount': hasil_win,
-                    'type': 'win',
-                    'admin': query.from_user.username or query.from_user.first_name,
-                    'time': str(datetime.now())
-                })
-            
-            # ===== YANG KALAH DIHAPUS (GAK USAH DICATAT) =====
-            # Kalah ya udah, gak usah masuk DB
             
             # ===== GAME NUMBER =====
             game_num = settings_db.get(chat_id, 1)
@@ -314,16 +295,6 @@ async def tambah_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         players_db[name] = jumlah
     
-    # Catat transaksi
-    transactions_db.append({
-        'chat_id': update.effective_chat.id,
-        'username': name,
-        'amount': jumlah,
-        'type': 'tambah',
-        'admin': update.effective_user.username or update.effective_user.first_name,
-        'time': str(datetime.now())
-    })
-    
     await update.message.reply_text(f"✅ *Saldo {name} bertambah {jumlah}*", parse_mode='Markdown')
 
 async def kurang_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -348,16 +319,6 @@ async def kurang_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Hapus kalo saldo 0
     if players_db[name] == 0:
         del players_db[name]
-    
-    # Catat transaksi
-    transactions_db.append({
-        'chat_id': update.effective_chat.id,
-        'username': name,
-        'amount': jumlah,
-        'type': 'kurang',
-        'admin': update.effective_user.username or update.effective_user.first_name,
-        'time': str(datetime.now())
-    })
     
     await update.message.reply_text(f"✅ *Saldo {name} berkurang {jumlah}*", parse_mode='Markdown')
 
@@ -449,7 +410,6 @@ async def reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     players_db.clear()
     history_db.clear()
     settings_db.clear()
-    transactions_db.clear()
     
     await update.message.reply_text("✅ *Semua data direset!*", parse_mode='Markdown')
 
@@ -523,16 +483,6 @@ def set_webhook():
     url = f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={WEBHOOK_URL}"
     response = requests.get(url)
     return jsonify(response.json())
-
-@app.route('/debug', methods=['GET'])
-def debug():
-    """Debug endpoint - lihat data"""
-    return jsonify({
-        "players": players_db,
-        "history": {str(k): v for k, v in history_db.items()},
-        "settings": settings_db,
-        "transactions": transactions_db[-10:]  # 10 transaksi terakhir
-    })
 
 # For local testing
 if __name__ == "__main__":
