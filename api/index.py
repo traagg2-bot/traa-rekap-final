@@ -10,6 +10,7 @@ import json
 import math
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+import asyncio
 
 # === CONFIG ===
 TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -20,86 +21,58 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://traa-rekap-final.vercel.app
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# === DATABASE (In-memory untuk Vercel) ===
+# === IN-MEMORY DATABASE ===
 players_db = {}
 history_db = {}
 settings_db = {}
-transactions_db = []
 
-def db_query(query, params=(), fetchone=False, fetchall=False):
-    """Simulasi database dengan dictionary"""
-    logger.info(f"DB Query: {query} - {params}")
-    
-    # Untuk SELECT
-    if query.startswith("SELECT") and "players" in query:
-        results = []
-        for name, bal in players_db.items():
-            results.append((name, bal))
-        if fetchall:
-            return results
-        elif fetchone and results:
-            return results[0]
-        return []
-    
-    elif query.startswith("SELECT") and "game_history" in query:
-        chat_id = params[0] if params else None
-        results = []
-        for game in history_db.get(chat_id, []):
-            results.append((game,))
-        if fetchall:
-            return results
-        return []
-    
-    elif query.startswith("SELECT") and "settings" in query:
-        chat_id = params[0] if params else None
-        game_num = settings_db.get(chat_id, 1)
-        return (game_num,) if fetchone else None
-    
-    # Untuk INSERT/UPDATE
-    elif "INSERT INTO players" in query:
-        name = params[0]
-        balance = params[1] if len(params) > 1 else 0
-        players_db[name] = balance
-        return None
-    
-    elif "UPDATE players" in query:
-        name = params[1] if len(params) > 1 else params[0]
-        balance = params[0] if "balance = ?" in query else None
-        if name in players_db and balance is not None:
-            players_db[name] = balance
-        return None
-    
-    elif "DELETE FROM players" in query:
-        name = params[0] if params else None
-        if name and name in players_db:
-            del players_db[name]
-        return None
-    
-    elif "INSERT INTO game_history" in query:
-        chat_id = params[0]
-        game_text = params[1]
-        if chat_id not in history_db:
-            history_db[chat_id] = []
-        history_db[chat_id].append(game_text)
-        return None
-    
-    elif "INSERT INTO settings" in query or "UPDATE settings" in query:
-        chat_id = params[0]
-        game_num = params[1] if len(params) > 1 else 1
-        settings_db[chat_id] = game_num
-        return None
-    
-    return []
+# === BOT APPLICATION ===
+application = Application.builder().token(TOKEN).build()
 
-# === BOT HANDLERS ===
+# ==================== HELPER FUNCTIONS ====================
+def parse_duel_data(text):
+    teams = {"KECIL": [], "BESAR": []}
+    current_team = None
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line: 
+            continue
+        if line.upper().startswith("KECIL:") or line.upper().startswith("K:"):
+            current_team = "KECIL"
+            continue
+        elif line.upper().startswith("BESAR:") or line.upper().startswith("B:"):
+            current_team = "BESAR"
+            continue
+        elif current_team:
+            match = re.search(r"(.+?)\s+(\d+)", line)
+            if match:
+                name = match.group(1).strip().upper()
+                modal = int(match.group(2))
+                teams[current_team].append({"name": name, "modal": modal})
+    return teams
+
+def hitung_setelah_fee(modal, fee_persen):
+    hasil_kotor = modal * 2
+    potongan = math.ceil(hasil_kotor * (fee_persen / 100))
+    return hasil_kotor - potongan
+
+def bulatkan_ke_bawah(angka):
+    if angka >= 0:
+        return (angka // 100) * 100
+    else:
+        return -((abs(angka) + 99) // 100 * 100)
+
+# ==================== COMMAND HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 REKAPWIN BOT\n\n"
+        "🤖 *REKAPWIN BOT VERCEL*\n\n"
         "Commands:\n"
-        "/rekap - Cek nominal\n"
-        "/rekapwin [fee] - Hitung kemenangan\n"
-        "/bulatkan - Bulatkan saldo\n"
-        "/cek [nama] - Cek saldo"
+        "• `/rekap` - Cek nominal\n"
+        "• `/rekapwin [fee]` - Hitung kemenangan\n"
+        "• `/bulatkan` - Bulatkan saldo\n"
+        "• `/cek [nama]` - Cek saldo\n"
+        "• `/reset` - Reset data (admin)",
+        parse_mode='Markdown'
     )
 
 async def rekap_cek(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -107,33 +80,15 @@ async def rekap_cek(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Balas ke pesan data duel!")
         return
     
-    text = update.message.reply_to_message.text
-    lines = text.split('\n')
-    k_vals, b_vals = [], []
-    current = None
-    
-    for line in lines:
-        line = line.strip().upper()
-        if line.startswith("K:") or line.startswith("KECIL:"):
-            current = "K"
-            continue
-        elif line.startswith("B:") or line.startswith("BESAR:"):
-            current = "B"
-            continue
-        elif current and line:
-            match = re.search(r"(\d+)", line)
-            if match:
-                val = int(match.group(1))
-                if current == "K":
-                    k_vals.append(val)
-                else:
-                    b_vals.append(val)
-    
+    data = parse_duel_data(update.message.reply_to_message.text)
+    k_vals = [p['modal'] for p in data["KECIL"]]
+    b_vals = [p['modal'] for p in data["BESAR"]]
     sum_k, sum_b = sum(k_vals), sum(b_vals)
+    
     msg = f"🔵 KECIL: {k_vals} = {sum_k}\n🔴 BESAR: {b_vals} = {sum_b}\n\n"
     
     if sum_k == sum_b:
-        msg += "✅ SAMA!"
+        msg += "✅ NOMINAL SAMA!"
     else:
         diff = abs(sum_k - sum_b)
         kurang = "KECIL" if sum_k < sum_b else "BESAR"
@@ -148,40 +103,125 @@ async def rekapwin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     fee = 5.5
     if context.args:
-        try: fee = float(context.args[0])
-        except: pass
+        try: 
+            fee = float(context.args[0])
+        except: 
+            pass
     
+    data = parse_duel_data(update.message.reply_to_message.text)
+    context.user_data['active_duel'] = {'data': data, 'fee': fee}
+    
+    keyboard = [
+        [InlineKeyboardButton("🔵 KECIL", callback_data="KECIL"),
+         InlineKeyboardButton("🔴 BESAR", callback_data="BESAR")]
+    ]
     await update.message.reply_text(
         f"💰 Fee: {fee}%\n🏆 Pilih pemenang:",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔵 KECIL", callback_data=f"win_KECIL_{fee}"),
-            InlineKeyboardButton("🔴 BESAR", callback_data=f"win_BESAR_{fee}")
-        ]])
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    data = query.data
-    if data.startswith("win_"):
-        _, winner, fee = data.split('_')
-        fee = float(fee)
-        
-        keyboard = [
-            [InlineKeyboardButton("2-0", callback_data=f"score_{winner}_{fee}_2-0"),
-             InlineKeyboardButton("2-1", callback_data=f"score_{winner}_{fee}_2-1")]
-        ]
-        await query.edit_message_text("🎯 Pilih skor:", reply_markup=InlineKeyboardMarkup(keyboard))
+    chat_id = query.message.chat_id
+    rekap = context.user_data.get('active_duel')
     
-    elif data.startswith("score_"):
-        _, winner, fee, score = data.split('_')
-        fee = float(fee)
+    if not rekap:
+        await query.edit_message_text("❌ Session expired! Ulangi /rekapwin")
+        return
+    
+    if query.data in ["KECIL", "BESAR"]:
+        winner = query.data
+        rekap['winner'] = winner
+        keyboard = [
+            [InlineKeyboardButton("2-0", callback_data=f"2-0_{winner}"),
+             InlineKeyboardButton("2-1", callback_data=f"2-1_{winner}")]
+        ]
+        await query.edit_message_text(f"🎯 Pilih skor:", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif query.data.startswith("2-0") or query.data.startswith("2-1"):
+        score, winner = query.data.split('_')
+        skor_simpan = score.replace("-", "")
         
-        await query.edit_message_text(f"✅ Game selesai! {winner} menang {score}")
-        # Di sini nanti proses saldo
+        # Proses saldo untuk pemenang
+        for p in rekap['data'][winner]:
+            hasil_win = hitung_setelah_fee(p['modal'], rekap['fee'])
+            
+            if p['name'] in players_db:
+                players_db[p['name']] = players_db[p['name']] + hasil_win
+            else:
+                players_db[p['name']] = hasil_win
+        
+        # Game number
+        game_num = settings_db.get(chat_id, 1)
+        
+        # Save history
+        total_modal = sum(p['modal'] for p in rekap['data'][winner])
+        if chat_id not in history_db:
+            history_db[chat_id] = []
+        history_db[chat_id].append(f"GAME {game_num} : {winner[0]} {skor_simpan} {total_modal}")
+        
+        # Update game number
+        settings_db[chat_id] = game_num + 1
+        
+        # Format output
+        hist_text = "\n".join(history_db.get(chat_id, [])[-5:])  # 5 game terakhir
+        
+        saldo_lines = []
+        total_saldo = 0
+        for name, bal in players_db.items():
+            total_saldo += bal
+            saldo_lines.append(f"{name} {bal}")
+        
+        admin = f"(@{query.from_user.username})" if query.from_user.username else "(User)"
+        
+        output = f"DEV: VERCEL\nROL: BOT\n\nLAST WIN : {admin}\n{hist_text}\n\nSALDO PEMAIN : ({total_saldo})\n" + "\n".join(saldo_lines)
+        
+        await query.edit_message_text(output)
+        del context.user_data['active_duel']
 
-# === FLASK APP ===
+async def cek_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        name = context.args[0].upper()
+        if name in players_db:
+            await update.message.reply_text(f"💰 {name}: {players_db[name]}")
+        else:
+            await update.message.reply_text(f"❌ {name} tidak ditemukan")
+    else:
+        if not players_db:
+            await update.message.reply_text("📭 Belum ada data saldo")
+            return
+        
+        lines = [f"{name}: {bal}" for name, bal in players_db.items()]
+        total = sum(players_db.values())
+        msg = f"💰 TOTAL SALDO: {total}\n\n" + "\n".join(lines)
+        await update.message.reply_text(msg)
+
+async def bulatkan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not players_db:
+        await update.message.reply_text("❌ Belum ada data player!")
+        return
+    
+    for name in list(players_db.keys()):
+        bal = players_db[name]
+        bal_baru = bulatkan_ke_bawah(bal)
+        if bal_baru == 0:
+            del players_db[name]
+        else:
+            players_db[name] = bal_baru
+    
+    await update.message.reply_text("✅ Saldo dibulatkan ke bawah (kelipatan 100)")
+
+# ==================== SETUP HANDLERS ====================
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("rekap", rekap_cek))
+application.add_handler(CommandHandler("rekapwin", rekapwin))
+application.add_handler(CommandHandler("cek", cek_saldo))
+application.add_handler(CommandHandler("bulatkan", bulatkan))
+application.add_handler(CallbackQueryHandler(callback_handler))
+
+# ==================== FLASK APP ====================
 app = Flask(__name__)
 
 @app.route('/webhook', methods=['POST'])
@@ -190,25 +230,37 @@ def webhook():
         data = request.get_json()
         logger.info(f"Webhook received: {data}")
         
-        # Process update with bot
-        # This is simplified - in production you'd use Application.process_update()
+        # Convert to Update object and process
+        update = Update.de_json(data, application.bot)
+        
+        # Process update (run in sync way for Flask)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(application.process_update(update))
+        loop.close()
         
         return jsonify({"status": "ok"})
     except Exception as e:
         logger.error(f"Webhook error: {e}")
-        return jsonify({"status": "error"}), 200
+        return jsonify({"status": "error", "message": str(e)}), 200
 
 @app.route('/health')
 def health():
     return jsonify({
         "status": "running",
         "time": str(datetime.now()),
-        "players": len(players_db)
+        "players": len(players_db),
+        "bot_token_valid": bool(TOKEN)
     })
 
 @app.route('/')
 def home():
-    return jsonify({"status": "Bot Rekapwin Vercel", "version": "1.0"})
+    return jsonify({
+        "status": "Bot Rekapwin Vercel",
+        "version": "2.0",
+        "players": len(players_db),
+        "commands": ["/start", "/rekap", "/rekapwin", "/cek", "/bulatkan"]
+    })
 
 @app.route('/setwebhook')
 def set_webhook():
